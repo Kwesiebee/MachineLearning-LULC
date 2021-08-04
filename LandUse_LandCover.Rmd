@@ -1,0 +1,433 @@
+---
+title: "Machine Learning for Land Cover Classification"
+author: "Kwesie Benjamin"
+date: "7/21/2021"
+output:
+  rmdformats::readthedown:
+    gallery: yes
+    highlight: tango
+    lightbox: yes
+    self_contained: yes
+    thumbnails: yes
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,comment="",collapse = TRUE, message = FALSE,warning = FALSE)
+```
+
+## Objectives
+
+1. To learn,how to build models usimg machine learning and how  to use such models for spatial predictions(eg.Landcover Classification).
+
+2. To learn how to evaluate such models using a test data.
+
+3. To familiarize onself with the caret package in R,and the classifier algorithm  Random Forest.
+
+
+
+
+## Overview
+
+  This tutorial seeks to demonstrate the basic workflow of building,testing,tuning and deploying models for landcover classification.The data being used is a(Landsat-8 OLI & TIRS) multispectral image.The image is a coverage of **Binduri Distrcit**,**Bawku Muncipal** and **Pusiga District** in the North-East Region of Ghana .
+  The Caret package in R, provides a standard platorm to use a variety of Classifier Algorithm.However, In this tutorial we would only be particular about the Random Forest  Algorithm which have gain tremendous use in spatial predictions in the area of Remote Sensing.
+  We would build a model using the Random Forest algorithm, and use the model to make spatial predictions on the landsat 8 image collected over the area of Binduri,bawku and Pusiga.
+  The 10 LandCover classes digitized(roi) within QGIS would serve as the response parameter, whereas the various band of landsat image, in this case, the blue,green,red,nir(near-infrared),swir1(shortwave infrared 1),swir2(shortwave infrared 2)bands in addition ndvi(Normalized Diffrence Vegetation Index),dem(Digital Elevation Model) would serve as the predictor variables.
+ 
+
+
+
+
+Let's load the following libraries.
+```{r message=FALSE, warning=FALSE}
+#rm(list=ls(all=TRUE))
+library(sf)
+library(dplyr)
+library(raster)
+library(tmap)
+library(caret)
+```
+
+
+Let's load our raster image file using the `stack()`function. 
+NB: remember to set your working directory using `setwd()`.
+```{r message=FALSE, warning=FALSE}
+setwd("C:/MachineLearning")
+bawkuStack <- raster::stack("binduri_bawku_pusiga.grd")
+
+print(bawkuStack) #Lets print-out to know more about the structure of image data
+```
+
+This a landsat 8 satellite image covering the binduri,Bawku(municipal)and Pusiga district of Ghana downloaded from the USGS staellite data platform.It has a **Path and Row of (194,052)**respectively.The regions of interest(roi) were collected based on the landsat, and also Google Satellite in QGIS with expert knowledge of the site and terrain.A total of 392 ploygons were collected(digitized) and grouped into 10 LandCover Classes.
+
+
+
+Lets plot a 5,4,3 false colour composite of our area of study(imageLayer) using the `plotRGB()` function.
+```{r message=FALSE, warning=FALSE}
+par(col.axis="white",tck=0)
+raster::plotRGB(bawkuStack,
+        r=5,g=4,b=3,
+        stretch="hist",
+        axes=TRUE,
+        main= "False Colour composite (5,4,3) of the Study Area")
+box(col="white")
+```
+
+
+
+
+
+Let's load our digitized polygons(Shapefiles) using the `read_sf()` function.
+```{r}
+roiTraining <- sf::read_sf("trainingRegions.shp") 
+
+#Lets convert Class to factor(to assign levels to the response)
+roiTraining$Class <- as.factor(roiTraining$Class)
+
+
+unique(roiTraining$Class) #This prints out the various unique classes
+```
+The output shows that there are indeed 10 unique classes.
+
+
+
+
+It's also very important to make sure our raster layer(bawkuStack) and the sf objects(roiTraining) have the same coordinate refrence system.
+```{r}
+cat("CRS of bawkuStack\n"); bawkuStack@crs;
+
+cat("\n") #just to create a break
+
+#Intentionally used crs for the sf object insted of st_crs.
+cat("CRS of roiTraining\n"); crs(roiTraining) 
+```
+The two object have the same coordinate refrence system.
+
+
+
+
+
+
+## Extraction of RasterLayer values 
+
+We would extract the raster values at the various polygon locations using the extract function `raster::extract()`.This are the values that would be used to train our models.
+```{r message=FALSE, warning=FALSE}
+extract <- raster::extract(bawkuStack,roiTraining,df=TRUE)
+
+head(extract)
+```
+
+
+
+
+
+
+Good, now we have a dataframe of values for the predictors.Now we need to find way to join our response variable(Classes) to this dataframe.We can easily do that using the dplyr `inner_join()` function .We then set the geometry column to NULL.
+
+```{r message=FALSE, warning=FALSE}
+extractMerged <- dplyr::inner_join(extract,roiTraining,by= c("ID"="id")) 
+
+extractMerged$geometry <- NULL
+```
+
+
+
+
+
+
+## Data Partitioning 
+
+At this stage we partition our dataset into two, thats a train and test dataset. We train the model with the train dataset and evaluate the model perfomance using the test data.
+
+We would use the caret function `createDataPartition()` to split data into training and testing sets.
+```{r message=FALSE, warning=FALSE}
+set.seed(123) 
+trainIndex <- caret::createDataPartition(extractMerged$ID,list = FALSE,p=0.7)
+trainData <- extractMerged[trainIndex,]  # 70% for training Data
+testData <- extractMerged[-trainIndex,] # 30% for testing Data
+```
+
+
+
+
+
+Let's now look at the count of the various Classes of the `{trainData}`.
+```{r message=FALSE, warning=FALSE}
+classCount <- trainData %>%
+  dplyr::group_by(Class) %>% 
+  count()
+
+print(classCount)
+```
+
+
+
+
+
+Proportion of the response Classes that makes up the training data.
+```{r}
+(prop.table(table(trainData$Class))*100)
+```
+Clearly an imbalance data but not that bad, very common in geospatial studies in relation to land cover analysis.
+
+
+
+
+
+We would also again look at the scale of the values for the vraious predictors.We print first six(6) rows of the trainData.
+```{r message=FALSE, warning=FALSE }
+print(head(trainData))
+```
+We can see clearly the different scale of measurement,especially for the dem and also ndvi.However,scale diffrence is not a issue for tree based classifier(Decision Tree,Random forest,Bagging etc.).
+
+
+
+
+
+## Model Training
+
+At this satge, we are ready to build our model.As was stated in the objectives, we would be developing the model using Random Forest algorithm.
+
+
+
+#### Random Forest
+
+Random Forest basically consist of an ensemble of trees. It also uses random Sampling with replacement(bootsrap samples).It can be used for both regression and classification.Rgression when the response variable is numeric and classification when the response variable is a factor(categorical).Each tree within the ensemble(forest) is considered as a model on its own, and at each terminal node, a random number of the predictor variables(mtry) are sampled for splitting.This split the new sample into the various class.Since each tree within the ensemble has equal weight, the total votes in each class is aggregated from each tree to identify the class with the highest votes.
+
+From the breif explaination above, we have 2 hyperparamters we can tune.
+
+1. The number of trees(ntree).
+
+2. The number of predictor variable randomly sampled as candidates for splitting at each terminal node(mtry).The default is the square root of the predictors.
+
+*NB:Random Forest does quite well in handling multicollinearity.*
+
+Let's define our response and predictor variables.
+```{r message=FALSE, warning=FALSE}
+respVar <- c("Class")
+
+predVar <- c("blue","green","red","nir","swir1","swir2","ndvi","dem")
+```
+
+
+
+
+
+
+After building the model,we would use test data(not seen by the model*) to provide unbiased evaluation of the model. 
+We then use Kappa Index as the main performance metric to choose the best model.
+
+It is recommended to use **ntree >= 500**.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(124)
+cvControl <- caret::trainControl(method = 'cv',
+                                 number = 10,
+                                 savePredictions = TRUE,
+                                 verboseIter = FALSE)
+
+# Train model using random Forest algorithm
+set.seed(124)
+rfModel <- caret::train(trainData[,predVar],
+                        trainData[,respVar],
+                        method="rf",
+                        metric = "Kappa",
+                        ntree= 500,
+                        trControl= cvControl,
+                        tuneLength=6,
+                        importance=TRUE)
+
+```
+
+
+
+
+
+Cross-validation results for `rfModel`.
+```{r}
+print(rfModel)
+```
+Cross-validation results shows a high Kappa Index of 0.9725665 at mtry = 3.This depicts a high concordance between the observed and predicted classes.
+
+
+
+
+
+
+#### Model Evaluation using Test Data
+
+We would evaluate the model using the test data.We would look at the confusion matrix, which would indicate to us how well our model fared in predicting the various classes in the test data.We would also compare the overall acurracy to the No Information Rate, this would indicate to us whether our model is worth using.
+
+Evaluation of the `rfModel` model using the test data.
+```{r message=FALSE, warning=FALSE}
+rfPredict <- predict(rfModel,testData)
+confusionMatrix(rfPredict,testData$Class)
+```
+Kappa Index of 0.975 with 95% confidence interval(0.9678, 0.9865) indicates high concordance between the observed and the predicted classes.Also, an Accuracy value 0.9786 is very encouraging, compared to the 
+No Information Rate of 0.1926.We can also see high values of sensitivity and specificity for the various classes of the response variable.
+
+
+
+
+
+## Feature Selection(recursive feature elimination)
+
+In machine learning, we are usually face with the problem of large numbers of predictors,some of this predictors have little to no contribution to the performance of the model.Given such situations, there is the need to find a way to drop some of this non-informative features(predictors) mainly to increase the performance metric(be it Kappa Index or Accuracy) or to find a subset of features(predictors) that reduces the complexity of the model.
+
+
+*NB:Multicollinearity does not affect the performance of Random Forest models.However the interpretability of variable importance becomes a problem*
+
+
+**RFE**: It begins with all predictors(backward selection), and works it way down by a given number of iterations untill a subset(combination of predictors) of optimal model performance is achieved.
+
+
+In the practical field of devloping models, large number of features(predictors) would increase
+
+1. Cost(cost of collecting/measuring information on the predictors) 
+2. Computation time.
+3. Complexity of the model.
+
+
+*NB: This is just a demonstration, we are not burden with large number of features(predictors).*
+*Our interest here, is whether there is a subset that could reduce the model complexity and yet increase the Kappa Index.*
+*There could also be a trade-off, where a reduction in complexity would lead to a minimal reduction in the performance metric(Kappa Index).*
+
+
+
+
+#### Subset sequence and recursive feature control
+
+```{r message=FALSE, warning=FALSE}
+set.seed(124)
+indexRfe <- createMultiFolds(trainData$Class, times=5) 
+
+##A sequence indicating how we want the predictor variables to be subseted
+predSeq <-seq(from=1, to =length(predVar),by=2)
+
+#RFE control function
+rfeCont <- rfeControl(method="cv",
+                      number = 10,
+                      verbose=FALSE,
+                      functions=rfFuncs,
+                      index=indexRfe)
+```
+
+
+
+
+
+
+#### Recursive feature elimination(ntree=500)
+
+```{r message=FALSE,warning=FALSE}
+#lets pre-process our training data before feeding into the rfe algorithm
+set.seed(124)
+rfModelRfe <- caret::rfe(trainData[,predVar],
+                         trainData[,respVar],
+                         sizes = predSeq,
+                         metric = "Kappa",
+                         ntree=500,
+                         method="rf",
+                         rfeControl = rfeCont)
+```
+
+
+
+
+Cross-validation results for the recursive feature elimination.
+```{r}
+print(rfModelRfe)
+```
+
+From running the Recursive feature Elimination(rfe), the top five variables were given as **nir, dem, ndvi, swir1, green**.The cross-validation assessment indicates that all eight(8) features were selected at a Kappa Index of 0.9676.
+
+
+
+Evaluation of the `testData` with the recursive feature elimination model.
+```{r message=FALSE, warning=FALSE}
+rfElemPredict <- predict(rfModelRfe,testData)
+
+confusionMatrix(rfElemPredict$pred,testData$Class)
+```
+This is not different from  the results of the initial model `rfModel`.
+
+**We would still proceed to making spatial predictions with the initial model `rfModel`.This is because `rfModelRfe`(recursive feature model) had no improvement(reduction) in it's complexity, nor improvement in it's perfomance metric(Kappa Index) in refrence to the intial model `rfModel`.**
+
+
+
+
+## Spatial Prediction
+
+We would make spatial predictions of the stack image using the initial model `rfModel`. We would use the`raster::predict()` function.
+
+```{r message=FALSE, warning=FALSE}
+bawkuPredictions<- raster::predict(bawkuStack,rfModel) 
+```
+
+
+
+
+
+```{r message=FALSE, warning=FALSE}
+#Lets define the plalette(mainly be using Hexadecimal colours).
+pal <-c('#ffffb3','#d8b365','#404040','#6a51a3','#018571','#2171b5','#bdd7e7',
+        '#cb181d','#1a9641','#a6d96a')
+
+tm_shape(bawkuPredictions)+
+  tm_raster(style = "cat",labels = c("Agriculture",
+                                     "Agriculture in shallows and recession","Burntland",
+                                     "Dam","Plantation","River","River(dried-up)",
+                                     "Settlements","Shrub and tree savanna","Wooded savanna"
+                                     ),
+            palette = pal,
+            title = "Legend")+
+  tm_layout(main.title= "Land Use Land Cover Map of Binduri,Bawku and Pusiga for April 2021",
+            main.title.size =.9 )+
+  tm_layout(legend.outside = TRUE,
+            legend.outside.position = "right",
+            legend.title.size = .8)
+```
+
+
+
+
+<!--html_preserve-->
+
+<body>
+    <style type="text/css">
+    
+	      .tab{
+	        margin-left:40px;
+	        padding-top:0;
+	      }
+	        
+	      p{
+	        	color: #555555;
+	        	font-family: Arial,sans-serif;
+	        	font-size: 16px;
+	        	font-weight: normal;
+	      }
+	  </style> 
+	  
+    <div>
+            <h2>
+            <center><b>Further Reading</b></center>
+            </h2>
+            <br>
+            <p>
+                Kuhn,M., and Johnson, K. (2013). <em>Applied Predictive Modeling</em>.1st edn. New York: 
+                Springer.
+            </p>
+            <br>
+            <p>
+                Hastie,T.,Tibshirani,R., and Friedman,J.H. (2009). <em>The Elements of Statistical Learning
+            </P>
+            <p class="tab">
+            :Data Mining,Inference and Prediction</em>.2nd edn. New York: Springer.
+            </p>
+            
+    </div>
+</body>
+
+<!--/html_preserve-->
